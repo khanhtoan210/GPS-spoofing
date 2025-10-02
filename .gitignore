@@ -1,0 +1,40 @@
+# Bỏ môi trường ảo
+dl/
+
+# VS Code settings
+.vscode/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build / distribution
+build/
+dist/
+*.egg-info/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Log và file tạm
+models/logs/
+*.tfevents.*
+*.tmp
+*.swp
+
+
+temp.ipynb
+data/
+data_v2/
+models/
+plot/
+Preprosse.ipynb
+learnCode.ipynb
+TestModel.ipynb
+yeah.ipynb
+make_data.py
+doc/
+yeah.ipynb
+plot_distribution.py
+Preprosse.ipynb
