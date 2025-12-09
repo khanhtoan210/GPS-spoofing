@@ -124,7 +124,7 @@ class Critic(Model):
 # --- 4. Mô Hình Tổ Hợp VAE-WGAN-GP ---
 @keras.saving.register_keras_serializable(package="VAE_GAN")
 class VAE_WGAN_GP(Model):
-    def __init__(self, encoder, decoder, critic, kappa=KAPPA, lambda_gp=LAMBDA_GP, **kwargs):
+    def __init__(self, encoder, decoder, critic, kappa=KAPPA, lambda_gp=LAMBDA_GP, latent_dim=LATENT_DIM, **kwargs):
         super(VAE_WGAN_GP, self).__init__(**kwargs)
         self.encoder = encoder
         self.decoder = decoder
