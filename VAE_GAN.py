@@ -368,3 +368,133 @@ class VAE_WGAN_GP(Model):
             
         else:
             raise ValueError("Input không hợp lệ. Cần (x_in, c_context) để tái tạo, hoặc c_context để tạo mẫu.")
+
+
+# TESTING
+import numpy as np
+from sklearn.metrics import roc_curve, auc, accuracy_score, confusion_matrix
+
+class SpoofingEvaluator:
+    def __init__(self, model, train_gen_data, train_gen_context):
+        """
+        Khởi tạo bộ đánh giá.
+        :param model: Mô hình VAE_WGAN_GP đã huấn luyện
+        :param train_gen_data: Dữ liệu thật (Genuine) dùng để training (để tính ngưỡng)
+        :param train_gen_context: Nhãn ngữ cảnh tương ứng (Static/Dynamic)
+        """
+        self.model = model
+        # Tính toán tham số tham chiếu từ dữ liệu huấn luyện (Genuine)
+        print("Đang tính toán thống kê tham chiếu từ tập huấn luyện...")
+        self.ref_mu_z = self._compute_reference_latent_mean(train_gen_data, train_gen_context)
+        
+        # Tính ngưỡng (Thresholds) dựa trên FPR mong muốn (ví dụ 5%)
+        self.thresholds = self._calibrate_thresholds(train_gen_data, train_gen_context, target_fpr=0.05)
+
+    def _compute_reference_latent_mean(self, x, c):
+        """Tính E[mu_zg]: Trung bình của các vector latent mean từ dữ liệu thật [cite: 552]"""
+        # Truy cập trực tiếp vào Encoder
+        z_mean, _, _ = self.model.encoder(x, c, training=False)
+        return np.mean(z_mean.numpy(), axis=0)
+
+    def _get_scores(self, x, c):
+        """Tính toán 3 loại điểm số cho một batch dữ liệu"""
+        # 1. Đi qua Encoder
+        z_mean, _, z_sample = self.model.encoder(x, c, training=False)
+        
+        # 2. Đi qua Decoder (Tái tạo)
+        x_recon = self.model.decoder(z_sample, c, training=False)
+        
+        # 3. Đi qua Critic (Đánh giá)
+        critic_score = self.model.critic(x, training=False)
+        
+        # Chuyển sang numpy để tính toán
+        x_np = x if isinstance(x, np.ndarray) else x.numpy()
+        x_recon_np = x_recon.numpy()
+        z_mean_np = z_mean.numpy()
+        critic_score_np = critic_score.numpy().flatten() # Flatten thành vector 1 chiều
+        
+        # --- Tính toán các chỉ số thống kê (Test Statistics) ---
+        
+        # A. D_l2: Khoảng cách Euclidean đến tâm latent của dữ liệu thật 
+        # zeta_l2 = || mu_z - E[mu_zg] ||_2
+        diff_latent = z_mean_np - self.ref_mu_z
+        score_l2 = np.linalg.norm(diff_latent, axis=1)
+        
+        # B. D_rec: Lỗi tái tạo theo chuẩn L1 (Manhattan) 
+        # zeta_rec = || x - x_hat ||_1
+        score_rec = np.sum(np.abs(x_np - x_recon_np), axis=1)
+        
+        # C. D_cr: Điểm Critic (Càng cao càng Thật, càng thấp càng Giả) 
+        score_cr = critic_score_np 
+        
+        return score_l2, score_rec, score_cr
+
+    def _calibrate_thresholds(self, x_gen, c_gen, target_fpr=0.05):
+        """Tính ngưỡng dựa trên tập Training Genuine với FPR cố định [cite: 581-584]"""
+        l2_scores, rec_scores, cr_scores = self._get_scores(x_gen, c_gen)
+        
+        # Với L2 và Reconstruction Error: Giá trị LỚN là Giả, NHỎ là Thật
+        # Ngưỡng là giá trị tại percentile thứ (1 - FPR)
+        thresh_l2 = np.percentile(l2_scores, (1 - target_fpr) * 100)
+        thresh_rec = np.percentile(rec_scores, (1 - target_fpr) * 100)
+        
+        # Với Critic Score: Giá trị LỚN là Thật, NHỎ là Giả (trong WGAN)
+        # Ngưỡng là giá trị tại percentile thứ (FPR)
+        thresh_cr = np.percentile(cr_scores, target_fpr * 100)
+        
+        print(f"Ngưỡng đã tính (FPR={target_fpr}): L2={thresh_l2:.4f}, Rec={thresh_rec:.4f}, Critic={thresh_cr:.4f}")
+        return {"l2": thresh_l2, "rec": thresh_rec, "cr": thresh_cr}
+
+    def evaluate_test_set(self, x_test, c_test, y_test):
+        """
+        Đánh giá trên tập test (bao gồm cả Genuine và Spoof)
+        y_test: 0 là Genuine, 1 là Spoofed
+        """
+        l2_scores, rec_scores, cr_scores = self._get_scores(x_test, c_test)
+        
+        results = {}
+        
+        # Đánh giá từng bộ phát hiện theo công thức (22) trong bài báo [cite: 584]
+        
+        # 1. D_l2 evaluation
+        # Spoofed nếu score > threshold
+        pred_l2 = (l2_scores >= self.thresholds['l2']).astype(int)
+        results['D_l2'] = self._calculate_metrics(y_test, pred_l2)
+        
+        # 2. D_rec evaluation
+        # Spoofed nếu score > threshold
+        pred_rec = (rec_scores >= self.thresholds['rec']).astype(int)
+        results['D_rec'] = self._calculate_metrics(y_test, pred_rec)
+        
+        # 3. D_cr evaluation
+        # Spoofed nếu score <= threshold (Lưu ý dấu <= cho Critic)
+        pred_cr = (cr_scores <= self.thresholds['cr']).astype(int)
+        results['D_cr'] = self._calculate_metrics(y_test, pred_cr)
+        
+        return results
+
+    def _calculate_metrics(self, y_true, y_pred):
+        acc = accuracy_score(y_true, y_pred)
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0 # Detection Rate
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0 # False Alarm Rate
+        return {"Accuracy": acc, "TPR": tpr, "FPR": fpr}
+
+# --- CÁCH SỬ DỤNG ---
+# Giả sử bạn đã có model 'vae_wgan' và dữ liệu:
+# train_x, train_c: Dữ liệu huấn luyện (chỉ chứa Genuine)
+# test_x, test_c: Dữ liệu kiểm thử (trộn lẫn Genuine và Spoof)
+# test_y: Nhãn kiểm thử (0: Genuine, 1: Spoof)
+
+# 1. Khởi tạo Evaluator (Tính toán ngưỡng tự động)
+# evaluator = SpoofingEvaluator(vae_wgan, train_x, train_c)
+
+# 2. Chạy đánh giá
+# metrics = evaluator.evaluate_test_set(test_x, test_c, test_y)
+
+# 3. In kết quả
+# for detector, scores in metrics.items():
+#     print(f"--- {detector} ---")
+#     print(f"Accuracy: {scores['Accuracy']:.4f}")
+#     print(f"TPR (Detection Rate): {scores['TPR']:.4f}")
+#     print(f"FPR (False Alarm): {scores['FPR']:.4f}")
